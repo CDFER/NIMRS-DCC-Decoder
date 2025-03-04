@@ -2,5 +2,8 @@
     "files.associations": {
         "*.html": "html",
         "cmath": "cpp"
-    }
+    },
+    "cSpell.words": [
+        "Nmra"
+    ]
 }
