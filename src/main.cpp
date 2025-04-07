@@ -92,7 +92,7 @@ float map8bitToPwm(uint8_t value) {
 
 // This call-back function is called when a CV Value changes so we can update CVs we're using
 void notifyCVChange(uint16_t CV, uint8_t Value) {
-	telnet.printf("Recived CV %d change to %d\n", CV, Value);  // Add telnet feedback
+	telnet.printf("Received CV %d change to %d\n", CV, Value);
 	switch (CV) {
 		case CV_VSTART:
 			cvMinSpeed = map8bitToPwm(Value);
@@ -101,8 +101,8 @@ void notifyCVChange(uint16_t CV, uint8_t Value) {
 		case CV_VHIGH:
 			cvMaxSpeed = map8bitToPwm(Value);
 			// Ensure min speed is not greater than max speed
-			if (cvMinSpeed > cvMaxSpeed && cvMaxSpeed > 0) {  // Allow maxSpeed to be 0 if intended
-				cvMinSpeed = cvMaxSpeed;
+			if (cvMinSpeed > cvMaxSpeed) {
+				cvMinSpeed = cvMaxSpeed - 1.0;
 				telnet.printf(" -> cvMaxSpeed updated to: %.2f (Adjusted cvMinSpeed to match)\n", cvMaxSpeed);
 			} else {
 				telnet.printf(" -> cvMaxSpeed updated to: %.2f\n", cvMaxSpeed);
@@ -123,33 +123,21 @@ void notifyDccSpeed(
 
 	// NmraDcc library gives Speed=0 for Estop, Speed=1 for Stop, Speed=2..N for actual steps
 	// We want our dccSpeed variable to be 0 for stop, 1..N-1 for steps
-	uint8_t newSpeed = 0;
+	uint8_t correctedSpeed = 0;
 	if (Speed >= 2) {
-		newSpeed = Speed - 1;  // Map 2..N -> 1..N-1
+		correctedSpeed = Speed - 1;	 // Map 2..N -> 1..N-1
 	} else {
-		newSpeed = 0;  // E-Stop (0) and Stop (1) both map to 0
-	}
-
-	// Determine the number of steps based on the packet
-	uint8_t effectiveNumSteps = 15;	 // Default to SPEED_STEP_14: ESTOP=0, 1 to 15
-	if (SpeedSteps == SPEED_STEP_28) {
-		effectiveNumSteps = 29;	 // ESTOP=0, 1 to 29
-	} else if (SpeedSteps == SPEED_STEP_128) {
-		effectiveNumSteps = 127;  // ESTOP=0, 1 to 127
+		correctedSpeed = 0;	 // E-Stop (0) and Stop (1) both map to 0
 	}
 
 	// Check if anything changed
-	if (dccDirection != Dir || dccSpeed != newSpeed || numSpeedSteps != effectiveNumSteps) {
-		telnet.printf("DCC Speed Update: Addr=%d, Speed=%d->%d, Dir=%d, Steps=%d\n",
-					  Addr,
-					  Speed,
-					  newSpeed,
-					  Dir,
-					  effectiveNumSteps);
+	if (dccDirection != Dir || dccSpeed != correctedSpeed || numSpeedSteps != SpeedSteps) {
+		telnet.printf(
+			"DCC Speed Update: Speed=%d->%d, Dir=%d, Steps=%d\n", Speed, correctedSpeed, Dir, SpeedSteps);
 		dccUpdated = true;
 		dccDirection = Dir;
-		dccSpeed = newSpeed;  // Store 0 for stop, 1 to MaxSteps-1 for move
-		numSpeedSteps = effectiveNumSteps;
+		dccSpeed = correctedSpeed;	// Store 0 for stop, 1 to MaxSteps-1 for move
+		numSpeedSteps = SpeedSteps;
 	}
 };
 
@@ -242,7 +230,6 @@ void motorTask(void* parameter) {
 	notifyCVResetFactoryDefault();
 
 	// Read the initial CV values and map them to the PWM range
-	// Use the helper function for consistency
 	cvMinSpeed = map8bitToPwm(Dcc.getCV(CV_VSTART));
 	cvMaxSpeed = map8bitToPwm(Dcc.getCV(CV_VHIGH));
 
@@ -252,11 +239,14 @@ void motorTask(void* parameter) {
 
 	// --- Task Variables ---
 	uint32_t last_telemetry_checkpoint = 0;
+	uint32_t last_PWM_update = 0;
 	float avgVolt = 12000.0;  // Initialize with a reasonable guess
 	float minVolt = 16000.0;
 
-	float motorPWM = 0.0;	// Current smoothed PWM value
-	float targetPWM = 0.0;	// Target PWM value based on dccSpeed
+	float smoothedPWM = 0.0;  // Current smoothed PWM value
+	float targetPWM = 0.0;	  // Target PWM value based on dccSpeed
+	float outputPWM = 0.0;
+	uint16_t outputIntPWM = 0;
 
 	bool motorEnabled = false;	// Track if MOTOR_EN_PIN is HIGH
 
@@ -264,90 +254,75 @@ void motorTask(void* parameter) {
 	while (true) {
 
 		// --- Voltage Sensing ---
-		// Read multiple times and average for stability? Optional.
 		float volt = float(analogReadMilliVolts(VCC_RAIL_SENSE)) * VCC_RAIL_FACTOR;
-		if (volt < minVolt) {
-			minVolt = volt;
-		}
-		avgVolt = (avgVolt * 0.99) + (volt * 0.01);	 // Simple IIR filter
+		minVolt = volt < minVolt ? volt : minVolt;
+		avgVolt = (avgVolt * 0.99) + (volt * 0.01);	 // Simple IIR filter (aka Exponential smoothing)
 
-		// --- Calculate Target PWM ---
-		// This happens periodically, but base recalculation on dccUpdated flag too
-		// Recalculate targetPWM if DCC speed/direction/steps changed
-		if (dccUpdated) {
-			if (dccSpeed == 0) {
-				targetPWM = 0.0;  // Target is 0 if speed step is 0
-			} else {
-				// dccSpeed is in range 1..numSpeedSteps-1
-				// Map [1 .. numSpeedSteps-1] to [cvMinSpeed .. cvMaxSpeed]
-
+		if (last_PWM_update < millis() - 25) {
+			// --- Calculate Target PWM ---
+			// Recalculate targetPWM if DCC speed/direction/steps changed
+			if (dccUpdated) {
 				targetPWM = map(float(dccSpeed), 1.0, float(numSpeedSteps), cvMinSpeed, cvMaxSpeed);
-				targetPWM = constrain(targetPWM, cvMinSpeed, cvMaxSpeed);
-			}
-			// telnet.printf("DCC Updated: Recalculated Target PWM = %.2f\n", targetPWM); // Debug
-			dccUpdated = false;	 // Reset flag after recalculating
-		}
-
-		// --- Smooth Motor PWM ---
-		// Apply smoothing constantly to ramp up/down
-		motorPWM = (motorPWM * 0.9) + (targetPWM * 0.1);  // Adjust smoothing factor (0.9) as needed
-
-		// --- Apply Stall Prevention Logic ---
-		// Calculate the final PWM value to be sent to the motor driver
-		float outputPWM = motorPWM;
-
-		// If motorPWM is moving towards 0 and is between 0 and cvMinSpeed, snap it to 0.
-		// If motorPWM is moving towards a non-zero target and is between 0 and cvMinSpeed, snap it UP to cvMinSpeed.
-		if (outputPWM > 0 && outputPWM < cvMinSpeed) {
-			if (targetPWM >= cvMinSpeed) {	// If the target is to run
-				outputPWM = cvMinSpeed;		// Snap up to minimum running speed
-			} else {						// If the target is 0 (stopping)
-				outputPWM = 0;				// Snap down to 0
-			}
-		}
-
-		// Ensure PWM is not negative due to float math oddities
-		if (outputPWM < 0) {
-			outputPWM = 0;
-		}
-
-		// Final quantized PWM value for the hardware
-		uint16_t finalPWM = uint16_t(outputPWM);
-
-		// --- Motor Control Logic ---
-		if (finalPWM > 0) {
-			// Enable Motor Driver if it's not already enabled
-			if (!motorEnabled) {
-				digitalWrite(MOTOR_EN_PIN, HIGH);
-				motorEnabled = true;
-				// setCpuFrequencyMhz(80);
-				// WiFi.setTxPower(WIFI_POWER_11dBm);
-				// if (telnet.isConnected()) {
-				// 	telnet.println("MOTOR ENABLED");
-				// }
+				// targetPWM = constrain(targetPWM, cvMinSpeed, cvMaxSpeed);
+				// telnet.printf("DCC Updated: Recalculated Target PWM = %.2f\n", targetPWM); // Debug
+				dccUpdated = false;	 // Reset flag after recalculating
 			}
 
-			// Set PWM based on direction
-			if (dccDirection == DCC_DIR_FWD) {
-				ledcWrite(0, 0);		 // Motor A off
-				ledcWrite(1, finalPWM);	 // Motor B PWM
-			} else {					 // DCC_DIR_REV
-				ledcWrite(0, finalPWM);	 // Motor A PWM
-				ledcWrite(1, 0);		 // Motor B off
+			// --- Smooth Motor PWM ---
+			// Apply smoothing constantly to ramp up/down
+			smoothedPWM = (smoothedPWM * 0.95) + (targetPWM * 0.05);  // Adjust smoothing factor as needed
+
+			// --- Apply Stall Prevention Logic ---
+			outputPWM = smoothedPWM;
+			// If smoothedPWM is moving towards 0 and is between 0 and cvMinSpeed, snap it to 0.
+			// If smoothedPWM is moving towards a non-zero target and is between 0 and cvMinSpeed, snap it UP to cvMinSpeed.
+			if (outputPWM > 0 && outputPWM <= cvMinSpeed) {
+				if (targetPWM > cvMinSpeed) {  // If the target is to run
+					outputPWM = cvMinSpeed;	   // Snap up to minimum running speed
+				} else {					   // If the target is 0 (stopping)
+					outputPWM = 0;			   // Snap down to 0
+				}
 			}
-		} else {  // finalPWM == 0
-			// Disable Motor Driver if it's not already disabled
-			if (motorEnabled) {
-				ledcWrite(0, 0);
-				ledcWrite(1, 0);
-				digitalWrite(MOTOR_EN_PIN, LOW);
-				motorEnabled = false;
-				// setCpuFrequencyMhz(240);
-				// WiFi.setTxPower(WIFI_POWER_19_5dBm);
-				// if (telnet.isConnected()) {
-				// 	telnet.println("MOTOR DISABLED");
-				// }
+
+			// Final quantized PWM value for the hardware
+			outputIntPWM = uint16_t(outputPWM);
+
+			// --- Motor Control Logic ---
+			if (outputIntPWM > 0) {
+				// Enable Motor Driver if it's not already enabled
+				if (!motorEnabled) {
+					digitalWrite(MOTOR_EN_PIN, HIGH);
+					motorEnabled = true;
+					// setCpuFrequencyMhz(80);
+					// WiFi.setTxPower(WIFI_POWER_11dBm);
+					// if (telnet.isConnected()) {
+					// 	telnet.println("MOTOR ENABLED");
+					// }
+				}
+
+				// Set PWM based on direction
+				if (dccDirection == DCC_DIR_FWD) {
+					ledcWrite(0, 0);			 // Motor A off
+					ledcWrite(1, outputIntPWM);	 // Motor B PWM
+				} else {						 // DCC_DIR_REV
+					ledcWrite(0, outputIntPWM);	 // Motor A PWM
+					ledcWrite(1, 0);			 // Motor B off
+				}
+			} else {  // outputIntPWM == 0
+				// Disable Motor Driver if it's not already disabled
+				if (motorEnabled) {
+					ledcWrite(0, 0);
+					ledcWrite(1, 0);
+					digitalWrite(MOTOR_EN_PIN, LOW);
+					motorEnabled = false;
+					// setCpuFrequencyMhz(240);
+					// WiFi.setTxPower(WIFI_POWER_19_5dBm);
+					// if (telnet.isConnected()) {
+					// 	telnet.println("MOTOR DISABLED");
+					// }
+				}
 			}
+			last_PWM_update = millis();
 		}
 
 		// --- Send Telemetry Periodically ---
@@ -355,18 +330,19 @@ void motorTask(void* parameter) {
 			if (telnet.isConnected()) {
 				telnet.printf(
 					"Vmin:%.1fV Vavg:%.1f DCC:%d Target:%.0f(%.0f%%) Smooth:%.0f(%.0f%%) Out:%d(%.0f%%) "
-					"Min:%.0f Max:%.0f\n",
+					"Min:%.0f Max:%.0f MCU Temp:%0.1f°C\n",
 					minVolt / 1000.0,
 					avgVolt / 1000.0,
 					dccSpeed,
 					targetPWM,
 					(targetPWM / float(MAX_PWM)) * 100.0,
-					motorPWM,
-					(motorPWM / float(MAX_PWM)) * 100.0,
-					finalPWM,
-					(float(finalPWM) / float(MAX_PWM)) * 100.0,
+					smoothedPWM,
+					(smoothedPWM / float(MAX_PWM)) * 100.0,
+					outputIntPWM,
+					(float(outputIntPWM) / float(MAX_PWM)) * 100.0,
 					cvMinSpeed,
-					cvMaxSpeed);
+					cvMaxSpeed,
+					temperatureRead());
 			}
 			last_telemetry_checkpoint = millis();
 			minVolt = 16000.0;	// Reset min voltage for next interval
@@ -392,7 +368,7 @@ void motorTask(void* parameter) {
 
 		// --- Task Delay ---
 		// Yield for other tasks. 1ms is frequent enough for receiving DCC commands.
-		vTaskDelay(pdMS_TO_TICKS(10));
+		vTaskDelay(pdMS_TO_TICKS(1));
 	}  // End while(true)
 }
 
