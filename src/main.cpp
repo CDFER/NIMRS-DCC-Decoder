@@ -1,21 +1,22 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <Preferences.h>
 
-#include <NmraDcc.h>
-#include <NeoPixelBus.h>
 #include <ESPTelnet.h>
+#include <NeoPixelBus.h>
+#include <NmraDcc.h>
 
 #include "secrets.h"
 
 TaskHandle_t motorTaskHandle;
 
 // #define DEBUG_DCC_MSG
+// #define DEBUG_DCC_ACK
 
-const uint16_t PixelCount = 8;	// this example assumes 4 pixels, making it smaller will cause a failure
-const uint8_t PixelPin = 13;	// make sure to set this to the correct pin, ignored for Esp8266
+const uint16_t PixelCount = 8;	// this example assumes 8 pixels
+const uint8_t PixelPin = 13;	// make sure to set this to the correct pin
 NeoPixelBus<NeoGrbFeature, NeoWs2812xMethod> Strip(PixelCount, PixelPin);
 
 ESPTelnet telnet;
@@ -23,7 +24,7 @@ IPAddress ip;
 uint16_t telnetPort = 23;
 
 // This is the default DCC Address
-#define DEFAULT_DECODER_ADDRESS 25
+#define DEFAULT_DECODER_ADDRESS 26
 
 #define DCC_PIN 23
 
@@ -37,16 +38,20 @@ uint16_t telnetPort = 23;
 #define SAFE_BOOT_GND_PIN 15
 
 #define VCC_RAIL_SENSE 36
-#define VCC_RAIL_FACTOR (33.0 + 10.0) / 10.0
+#define VCC_RAIL_FACTOR (33000.0 + 10000.0) / 10000.0  // Check resistor values: (R1+R2)/R2
 
-uint8_t dccDirection = 0;
 bool dccUpdated = true;
+uint8_t dccDirection = DCC_DIR_FWD;
+uint8_t dccSpeed = 0;					 // Speed step 0..N-1 (e.g., 0..127 for 128 steps)
+uint8_t numSpeedSteps = SPEED_STEP_128;	 // Default to 128 steps
 
-uint8_t dccSpeed = 0;
-uint8_t numSpeedSteps = SPEED_STEP_128;
+#define PWM_FREQUENCY 20000
+#define PWM_RESOLUTION 10
+#define MAX_PWM ((1 << PWM_RESOLUTION) - 1)	 // 1023 for 10-bit resolution
 
-uint8_t motorStart;
-uint8_t motorMax;
+// Use float for CVs mapped to PWM range for better precision in calculations
+float cvMinSpeed = 0.0;
+float cvMaxSpeed = float(MAX_PWM);	// Default max speed to full PWM range
 
 // Structure for CV Values Table
 struct CVPair {
@@ -60,62 +65,112 @@ struct CVPair {
 
 // Default CV Values Table
 CVPair FactoryDefaultCVs[] = {
-	// The CV Below defines the Short DCC Address
 	{ CV_MULTIFUNCTION_PRIMARY_ADDRESS, DEFAULT_DECODER_ADDRESS },
 
-	// Three Step Speed Table
-	{ CV_VSTART, 64 },	//155
-	{ CV_VHIGH, 255 },	//180
+	{ CV_VSTART, 150 },	 // of 255, adjust as needed for your motor
+	{ CV_VHIGH, 255 },	 // of 255, adjust as needed for your motor
 
-	// These two CVs define the Long DCC Address
-	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_MSB, CALC_MULTIFUNCTION_EXTENDED_ADDRESS_MSB(DEFAULT_DECODER_ADDRESS) },
-	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_LSB, CALC_MULTIFUNCTION_EXTENDED_ADDRESS_LSB(DEFAULT_DECODER_ADDRESS) },
+	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_MSB,
+	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_MSB(DEFAULT_DECODER_ADDRESS) },
+	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_LSB,
+	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_LSB(DEFAULT_DECODER_ADDRESS) },
 
-	// ONLY uncomment 1 CV_29_CONFIG line below as approprate
-	//{CV_29_CONFIG,                                      0}, // Short Address 14 Speed Steps
-	//{CV_29_CONFIG,                       CV29_F0_LOCATION}, // Short Address 28/128 Speed Steps
-	{ CV_29_CONFIG, CV29_EXT_ADDRESSING | CV29_F0_LOCATION },  // Long  Address 28/128 Speed Steps
+	// Ensure CV29 matches decoder capabilities and desired operation
+	// Long Address, 28/128 Speed Steps, F0 Location bit (for lights)
+	{ CV_29_CONFIG, CV29_EXT_ADDRESSING | CV29_F0_LOCATION },
 };
 
 NmraDcc Dcc;
 
 uint8_t FactoryDefaultCVIndex = 0;
 
+// --- Helper function to map a 8bit value (0-255) to PWM range (0-MAX_PWM) float ---
+float map8bitToPwm(uint8_t value) {
+	// Map linearly from 8bit range (0-255) to PWM range (0-MAX_PWM)
+	return map(float(value), 0.0, 255.0, 0.0, float(MAX_PWM));
+}
+
 // This call-back function is called when a CV Value changes so we can update CVs we're using
 void notifyCVChange(uint16_t CV, uint8_t Value) {
+	telnet.printf("Recived CV %d change to %d\n", CV, Value);  // Add telnet feedback
 	switch (CV) {
 		case CV_VSTART:
-			motorStart = Value;
+			cvMinSpeed = map8bitToPwm(Value);
+			telnet.printf(" -> cvMinSpeed updated to: %.2f\n", cvMinSpeed);
 			break;
-
 		case CV_VHIGH:
-			motorMax = Value;
+			cvMaxSpeed = map8bitToPwm(Value);
+			// Ensure min speed is not greater than max speed
+			if (cvMinSpeed > cvMaxSpeed && cvMaxSpeed > 0) {  // Allow maxSpeed to be 0 if intended
+				cvMinSpeed = cvMaxSpeed;
+				telnet.printf(" -> cvMaxSpeed updated to: %.2f (Adjusted cvMinSpeed to match)\n", cvMaxSpeed);
+			} else {
+				telnet.printf(" -> cvMaxSpeed updated to: %.2f\n", cvMaxSpeed);
+			}
 			break;
+		default: telnet.printf(" -> CV %d not supported yet...\n", CV); break;
 	}
 }
 
 void notifyCVResetFactoryDefault() {
-	// Make FactoryDefaultCVIndex non-zero and equal to num CV's to be reset
-	// to flag to the loop() function that a reset to Factory Defaults needs to be done
+	telnet.println("CV Factory Reset Requested");
 	FactoryDefaultCVIndex = sizeof(FactoryDefaultCVs) / sizeof(CVPair);
 };
 
 // This call-back function is called whenever we receive a DCC Speed packet for our address
-void notifyDccSpeed(uint16_t Addr, DCC_ADDR_TYPE AddrType, uint8_t Speed, DCC_DIRECTION Dir, DCC_SPEED_STEPS SpeedSteps) {
-	if (dccDirection != Dir || dccSpeed != Speed - 1 || numSpeedSteps != SpeedSteps) {
+void notifyDccSpeed(
+	uint16_t Addr, DCC_ADDR_TYPE AddrType, uint8_t Speed, DCC_DIRECTION Dir, DCC_SPEED_STEPS SpeedSteps) {
+
+	// NmraDcc library gives Speed=0 for Estop, Speed=1 for Stop, Speed=2..N for actual steps
+	// We want our dccSpeed variable to be 0 for stop, 1..N-1 for steps
+	uint8_t newSpeed = 0;
+	if (Speed >= 2) {
+		newSpeed = Speed - 1;  // Map 2..N -> 1..N-1
+	} else {
+		newSpeed = 0;  // E-Stop (0) and Stop (1) both map to 0
+	}
+
+	// Determine the number of steps based on the packet
+	uint8_t effectiveNumSteps = 15;	 // Default to SPEED_STEP_14: ESTOP=0, 1 to 15
+	if (SpeedSteps == SPEED_STEP_28) {
+		effectiveNumSteps = 29;	 // ESTOP=0, 1 to 29
+	} else if (SpeedSteps == SPEED_STEP_128) {
+		effectiveNumSteps = 127;  // ESTOP=0, 1 to 127
+	}
+
+	// Check if anything changed
+	if (dccDirection != Dir || dccSpeed != newSpeed || numSpeedSteps != effectiveNumSteps) {
+		telnet.printf("DCC Speed Update: Addr=%d, Speed=%d->%d, Dir=%d, Steps=%d\n",
+					  Addr,
+					  Speed,
+					  newSpeed,
+					  Dir,
+					  effectiveNumSteps);
 		dccUpdated = true;
 		dccDirection = Dir;
-		dccSpeed = Speed - 1;
-		numSpeedSteps = SpeedSteps;
+		dccSpeed = newSpeed;  // Store 0 for stop, 1 to MaxSteps-1 for move
+		numSpeedSteps = effectiveNumSteps;
 	}
 };
 
 // This call-back function is called whenever we receive a DCC Function packet for our address
 void notifyDccFunc(uint16_t Addr, DCC_ADDR_TYPE AddrType, FN_GROUP FuncGrp, uint8_t FuncState) {
-
-	if (FuncGrp == FN_0_4) {
-		// newLedState = (FuncState & FN_BIT_00) ? 1 : 0;
-	}
+	// // Example: Control onboard LED with F0
+	// if (FuncGrp == FN_0_4) {
+	// 	if (FuncState & FN_BIT_00) {				// Check F0 state
+	// 		digitalWrite(LED_INDICATOR_PIN, HIGH);	// Turn on LED if F0 is ON
+	// 		telnet.println("F0 ON");
+	// 	} else {
+	// 		digitalWrite(LED_INDICATOR_PIN, LOW);  // Turn off LED if F0 is OFF
+	// 		telnet.println("F0 OFF");
+	// 	}
+	// 	// Add other function controls here (F1-F4)
+	// } else if (FuncGrp == FN_5_8) {
+	// 	// Handle F5-F8
+	// } else if (FuncGrp == FN_9_12) {
+	// 	// Handle F9-F12
+	// }
+	// // Add more groups as needed
 }
 
 // This call-back function is called whenever we receive a DCC Packet
@@ -131,165 +186,241 @@ void notifyDccMsg(DCC_MSG* Msg) {
 #endif
 
 // This call-back function is called by the NmraDcc library when a DCC ACK needs to be sent
-// Calling this function should cause an increased 60ma current drain on the power supply for 6ms to ACK a CV Read
-// So we will just turn the motor on for 8ms and then turn it off again.
 void notifyCVAck(void) {
 #ifdef DEBUG_DCC_ACK
-	Serial.println("notifyCVAck");
+	telnet.println("notifyCVAck: Pulsing motor");
 #endif
+	// Ensure motor enable pin is high temporarily if needed, depends on H-bridge logic
+	digitalWrite(MOTOR_EN_PIN, HIGH);  // Ensure driver is enabled for ACK pulse
 
-	digitalWrite(MOTOR_A_PIN, HIGH);
-	digitalWrite(MOTOR_B_PIN, LOW);
+	// Pulse the motor briefly (this assumes H-bridge pins are setup for PWM)
+	// Apply a noticeable PWM value
+	uint16_t ackPulsePwm = (cvMinSpeed > 50) ? uint16_t(cvMinSpeed) : 100;	// Use min speed or a fixed value
+	ledcWrite(0, ackPulsePwm);												// Pulse one direction
+	ledcWrite(1, 0);
 
-	delay(8);
+	delay(8);  // Hold pulse for ~8ms
 
-	digitalWrite(MOTOR_A_PIN, LOW);
-	digitalWrite(MOTOR_B_PIN, LOW);
+	// Turn off PWM channels and disable driver (if it wasn't already enabled)
+	ledcWrite(0, 0);
+	ledcWrite(1, 0);
+	// The main loop will re-enable the motor driver based on dccSpeed later
+	digitalWrite(MOTOR_EN_PIN, LOW);  // Turn off driver immediately after ACK
+
+#ifdef DEBUG_DCC_ACK
+	telnet.println("notifyCVAck: Pulse complete");
+#endif
+}
+
+void onTelnetConnect(String ip) {
+	telnet.println("\n--- NIMRS Decoder ---");
+	telnet.printf("Initial CVs -> VStart(PWM): %.2f, VHigh(PWM): %.2f\n", cvMinSpeed, cvMaxSpeed);
 }
 
 void motorTask(void* parameter) {
-	// telnet.onConnect(onTelnetConnect);
+	telnet.onConnect(onTelnetConnect);
 	telnet.begin(telnetPort);
 
-#define PWM_FREQUENCY 120
-#define PWM_RESOLUTION 10
-#define MAX_PWM 1 << PWM_RESOLUTION
-
-	analogWriteFrequency(PWM_FREQUENCY);
-	analogWriteResolution(PWM_RESOLUTION);
-
-	bool lowerPowerMode = false;
-	bool batteryChargeMode = true;
-
-	// Setup the Pins for the Motor H-Bridge Driver
-	pinMode(MOTOR_A_PIN, OUTPUT);
-	pinMode(MOTOR_B_PIN, OUTPUT);
-	analogWrite(MOTOR_A_PIN, 0);
-	analogWrite(MOTOR_B_PIN, 0);
-
 	pinMode(MOTOR_EN_PIN, OUTPUT);
-	digitalWrite(MOTOR_EN_PIN, HIGH);
+	digitalWrite(MOTOR_EN_PIN, LOW);  // Start with motor driver disabled
+
+	ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION);
+	ledcSetup(1, PWM_FREQUENCY, PWM_RESOLUTION);
+
+	ledcAttachPin(MOTOR_A_PIN, 0);
+	ledcAttachPin(MOTOR_B_PIN, 1);
 
 	pinMode(VCC_RAIL_SENSE, INPUT);
 
-	Dcc.pin(DCC_PIN, 0);
-
+	// --- Initialize DCC ---
+	Dcc.pin(DCC_PIN, 0);  // DCC signal pin, no inversion
+	// Minimal flags, let CV29 control address mode etc.
+	// FLAGS_AUTO_FACTORY_DEFAULT allows reset via broadcast. Add others if needed.
 	Dcc.init(MAN_ID_DIY, 10, FLAGS_MY_ADDRESS_ONLY | FLAGS_AUTO_FACTORY_DEFAULT, 0);
 
-	// Uncomment to force CV Reset to Factory Defaults
+	// Uncomment to force CV Reset to Factory Defaults on boot
 	notifyCVResetFactoryDefault();
 
-	// Read the current CV values for vStart and vHigh
-	motorStart = Dcc.getCV(CV_VSTART);
-	motorMax = Dcc.getCV(CV_VHIGH);
+	// Read the initial CV values and map them to the PWM range
+	// Use the helper function for consistency
+	cvMinSpeed = map8bitToPwm(Dcc.getCV(CV_VSTART));
+	cvMaxSpeed = map8bitToPwm(Dcc.getCV(CV_VHIGH));
 
+	// --- Initialize NeoPixels ---
 	Strip.Begin();
-	Strip.Show();
+	Strip.Show();  // Initialize all pixels to 'off'
 
+	// --- Task Variables ---
 	uint32_t last_telemetry_checkpoint = 0;
+	float avgVolt = 12000.0;  // Initialize with a reasonable guess
+	float minVolt = 16000.0;
 
-	float volt = 0.0;
-	float min_volt = 0.0;
-	float powerFactor = 1.0;
-	uint16_t motorPWM = 0;
+	float motorPWM = 0.0;	// Current smoothed PWM value
+	float targetPWM = 0.0;	// Target PWM value based on dccSpeed
 
+	bool motorEnabled = false;	// Track if MOTOR_EN_PIN is HIGH
+
+	// --- Main Motor Control Loop ---
 	while (true) {
 
-		volt = float(analogReadMilliVolts(VCC_RAIL_SENSE)) * VCC_RAIL_FACTOR;
-		if (volt < min_volt) { min_volt = volt; }
+		// --- Voltage Sensing ---
+		// Read multiple times and average for stability? Optional.
+		float volt = float(analogReadMilliVolts(VCC_RAIL_SENSE)) * VCC_RAIL_FACTOR;
+		if (volt < minVolt) {
+			minVolt = volt;
+		}
+		avgVolt = (avgVolt * 0.99) + (volt * 0.01);	 // Simple IIR filter
 
-		// if (volt > 6000.0) {
-		// 	powerFactor = (12000.0 / (volt)) * 0.5 + 0.5;
-		// }
-		// motorPWM = uint16_t(map(float(dccSpeed) * powerFactor, 0.0, float(numSpeedSteps), 0.0, MAX_PWM));
-		// motorPWM = constrain(motorPWM, 0, MAX_PWM);
-		motorPWM = dccSpeed * 2 * 4;
+		// --- Calculate Target PWM ---
+		// This happens periodically, but base recalculation on dccUpdated flag too
+		// Recalculate targetPWM if DCC speed/direction/steps changed
+		if (dccUpdated) {
+			if (dccSpeed == 0) {
+				targetPWM = 0.0;  // Target is 0 if speed step is 0
+			} else {
+				// dccSpeed is in range 1..numSpeedSteps-1
+				// Map [1 .. numSpeedSteps-1] to [cvMinSpeed .. cvMaxSpeed]
 
-
-
-		if (millis() - 100 > last_telemetry_checkpoint) {
-			if (telnet.isConnected()) {
-				telnet.printf("%0.2f, %i\n", (min_volt) / 1000, motorPWM);
+				targetPWM = map(float(dccSpeed), 1.0, float(numSpeedSteps), cvMinSpeed, cvMaxSpeed);
+				targetPWM = constrain(targetPWM, cvMinSpeed, cvMaxSpeed);
 			}
-			last_telemetry_checkpoint = millis();
-			min_volt = 16000.0;
+			// telnet.printf("DCC Updated: Recalculated Target PWM = %.2f\n", targetPWM); // Debug
+			dccUpdated = false;	 // Reset flag after recalculating
 		}
 
-		telnet.loop();
+		// --- Smooth Motor PWM ---
+		// Apply smoothing constantly to ramp up/down
+		motorPWM = (motorPWM * 0.9) + (targetPWM * 0.1);  // Adjust smoothing factor (0.9) as needed
+
+		// --- Apply Stall Prevention Logic ---
+		// Calculate the final PWM value to be sent to the motor driver
+		float outputPWM = motorPWM;
+
+		// If motorPWM is moving towards 0 and is between 0 and cvMinSpeed, snap it to 0.
+		// If motorPWM is moving towards a non-zero target and is between 0 and cvMinSpeed, snap it UP to cvMinSpeed.
+		if (outputPWM > 0 && outputPWM < cvMinSpeed) {
+			if (targetPWM >= cvMinSpeed) {	// If the target is to run
+				outputPWM = cvMinSpeed;		// Snap up to minimum running speed
+			} else {						// If the target is 0 (stopping)
+				outputPWM = 0;				// Snap down to 0
+			}
+		}
+
+		// Ensure PWM is not negative due to float math oddities
+		if (outputPWM < 0) {
+			outputPWM = 0;
+		}
+
+		// Final quantized PWM value for the hardware
+		uint16_t finalPWM = uint16_t(outputPWM);
+
+		// --- Motor Control Logic ---
+		if (finalPWM > 0) {
+			// Enable Motor Driver if it's not already enabled
+			if (!motorEnabled) {
+				digitalWrite(MOTOR_EN_PIN, HIGH);
+				motorEnabled = true;
+				// setCpuFrequencyMhz(80);
+				// WiFi.setTxPower(WIFI_POWER_11dBm);
+				// if (telnet.isConnected()) {
+				// 	telnet.println("MOTOR ENABLED");
+				// }
+			}
+
+			// Set PWM based on direction
+			if (dccDirection == DCC_DIR_FWD) {
+				ledcWrite(0, 0);		 // Motor A off
+				ledcWrite(1, finalPWM);	 // Motor B PWM
+			} else {					 // DCC_DIR_REV
+				ledcWrite(0, finalPWM);	 // Motor A PWM
+				ledcWrite(1, 0);		 // Motor B off
+			}
+		} else {  // finalPWM == 0
+			// Disable Motor Driver if it's not already disabled
+			if (motorEnabled) {
+				ledcWrite(0, 0);
+				ledcWrite(1, 0);
+				digitalWrite(MOTOR_EN_PIN, LOW);
+				motorEnabled = false;
+				// setCpuFrequencyMhz(240);
+				// WiFi.setTxPower(WIFI_POWER_19_5dBm);
+				// if (telnet.isConnected()) {
+				// 	telnet.println("MOTOR DISABLED");
+				// }
+			}
+		}
+
+		// --- Send Telemetry Periodically ---
+		if (millis() - 100 > last_telemetry_checkpoint) {
+			if (telnet.isConnected()) {
+				telnet.printf(
+					"Vmin:%.1fV Vavg:%.1f DCC:%d Target:%.0f(%.0f%%) Smooth:%.0f(%.0f%%) Out:%d(%.0f%%) "
+					"Min:%.0f Max:%.0f\n",
+					minVolt / 1000.0,
+					avgVolt / 1000.0,
+					dccSpeed,
+					targetPWM,
+					(targetPWM / float(MAX_PWM)) * 100.0,
+					motorPWM,
+					(motorPWM / float(MAX_PWM)) * 100.0,
+					finalPWM,
+					(float(finalPWM) / float(MAX_PWM)) * 100.0,
+					cvMinSpeed,
+					cvMaxSpeed);
+			}
+			last_telemetry_checkpoint = millis();
+			minVolt = 16000.0;	// Reset min voltage for next interval
+		}
 
 		// You MUST call the Dcc.process() method frequently for correct library operation
 		Dcc.process();
 
-		if (dccSpeed > 0) {
-			if (lowerPowerMode == false) {
-				digitalWrite(MOTOR_EN_PIN, HIGH);
-				lowerPowerMode = true;
-				setCpuFrequencyMhz(80);
-				WiFi.setTxPower(WIFI_POWER_11dBm);
-				if (telnet.isConnected()) {
-					telnet.println("LOW POWER MODE");
-				}
-			}
-
-			if (dccDirection == DCC_DIR_FWD) {
-				analogWrite(MOTOR_A_PIN, 0);
-				analogWrite(MOTOR_B_PIN, motorPWM);
-			} else if (dccDirection == DCC_DIR_REV) {
-				analogWrite(MOTOR_A_PIN, motorPWM);
-				analogWrite(MOTOR_B_PIN, 0);
-			}
-
-		} else {
-			if (lowerPowerMode == true) {
-				digitalWrite(MOTOR_EN_PIN, LOW);
-				lowerPowerMode = false;
-				setCpuFrequencyMhz(240);
-				WiFi.setTxPower(WIFI_POWER_19_5dBm);
-				analogWrite(MOTOR_A_PIN, 0);
-				analogWrite(MOTOR_B_PIN, 0);
-				if (telnet.isConnected()) {
-					telnet.println("HIGH POWER MODE");
-				}
-			}
-		}
-
-		// Handle resetting CVs back to Factory Defaults
+		// --- Handle CV Reset ---
+		// Handle resetting CVs back to Factory Defaults (if requested by notifyCVResetFactoryDefault)
 		if (FactoryDefaultCVIndex && Dcc.isSetCVReady()) {
 			FactoryDefaultCVIndex--;  // Decrement first as initially it is the size of the array
-			Dcc.setCV(FactoryDefaultCVs[FactoryDefaultCVIndex].CV, FactoryDefaultCVs[FactoryDefaultCVIndex].Value);
+			uint16_t cvToSet = FactoryDefaultCVs[FactoryDefaultCVIndex].CV;
+			uint8_t valToSet = FactoryDefaultCVs[FactoryDefaultCVIndex].Value;
+			telnet.printf("Resetting CV %d to %d\n", cvToSet, valToSet);
+			Dcc.setCV(cvToSet, valToSet);
+			// We don't need to call notifyCVChange here, NmraDcc will do that automatically
+			// if the setCV is successful and the value actually changes internally.
 		}
 
-		vTaskDelay(pdMS_TO_TICKS(1));
-	}
+		// --- Telnet Loop ---
+		telnet.loop();	// Handle Telnet connections and input
+
+		// --- Task Delay ---
+		// Yield for other tasks. 1ms is frequent enough for receiving DCC commands.
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}  // End while(true)
 }
 
+// --- otaTask ---
 void otaTask(void* parameter) {
 	ArduinoOTA.setPort(3232);
 	ArduinoOTA.setHostname("NIMRS");  // Hostname for OTA updates
 
-	// Configure OTA event callbacks
 	ArduinoOTA
 		.onStart([]() {
-			// Stop motors and reset outputs before update
-			digitalWrite(MOTOR_EN_PIN, LOW);
-			analogWrite(MOTOR_A_PIN, 0);
-			analogWrite(MOTOR_B_PIN, 0);
+			// vTaskSuspend(motorTaskHandle);		// Suspend motor task during OTA (DO NOT ENABLE)
+			digitalWrite(MOTOR_EN_PIN, LOW);		// Ensure motor is off
+			digitalWrite(LED_INDICATOR_PIN, HIGH);	// LED solid on during update
 
-			// Visual indicator (LED) for update start
-			digitalWrite(LED_INDICATOR_PIN, HIGH);
-
-			// Determine update type
 			String type;
 			if (ArduinoOTA.getCommand() == U_FLASH) {
 				type = "sketch";
 			} else {  // U_SPIFFS
 				type = "filesystem";
 			}
-
 			Serial.println("Start updating " + type);
+			//telnet.println("Starting OTA update...");  // Notify telnet users
+			// telnet.stop();							   // Stop telnet server
 		})
 		.onEnd([]() {
 			Serial.println("\nEnd");
+			// digitalWrite(LED_INDICATOR_PIN, LOW);  // Turn off LED
+			// Restart occurs automatically after successful firmware update
 		})
 		.onProgress([](unsigned int progress, unsigned int total) {
 			// Show update progress and toggle LED
@@ -297,61 +428,109 @@ void otaTask(void* parameter) {
 			digitalWrite(LED_INDICATOR_PIN, !digitalRead(LED_INDICATOR_PIN));
 		})
 		.onError([](ota_error_t error) {
-			// Handle different error cases
 			Serial.printf("Error[%u]: ", error);
-			if (error == OTA_AUTH_ERROR) {
+			if (error == OTA_AUTH_ERROR)
 				Serial.println("Auth Failed");
-			} else if (error == OTA_BEGIN_ERROR) {
+			else if (error == OTA_BEGIN_ERROR)
 				Serial.println("Begin Failed");
-			} else if (error == OTA_CONNECT_ERROR) {
+			else if (error == OTA_CONNECT_ERROR)
 				Serial.println("Connect Failed. Firewall Issue?");
-			} else if (error == OTA_RECEIVE_ERROR) {
+			else if (error == OTA_RECEIVE_ERROR)
 				Serial.println("Receive Failed");
-			} else if (error == OTA_END_ERROR) {
+			else if (error == OTA_END_ERROR)
 				Serial.println("End Failed");
-			}
 		});
 
 	ArduinoOTA.setTimeout(30000);  // 30-second timeout
 	ArduinoOTA.begin();
+	Serial.println("OTA Ready");
 
-	// Main OTA handling loop
 	while (true) {
 		ArduinoOTA.handle();
 		vTaskDelay(pdMS_TO_TICKS(1));
 	}
 }
 
+// --- setup (Minor adjustments) ---
 void setup() {
-	// this resets all the addressable leds to an off state
+	Serial.begin(115200);
+	Serial.println("\nBooting NIMRS Decoder...");
+
+	// --- Initialize LED ---
+	pinMode(LED_INDICATOR_PIN, OUTPUT);
+	digitalWrite(LED_INDICATOR_PIN, LOW);  // LED off initially
+
+	// Initialize NeoPixels early to turn them off
 	Strip.Begin();
 	Strip.Show();
 
-	Serial.begin(115200);
-
+	// --- WiFi Setup ---
 	WiFi.mode(WIFI_STA);
 	WiFi.begin(ssid, password);
-	WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Set WiFi RF power output level
+	WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Set desired WiFi power
 	WiFi.setAutoReconnect(true);
-	WiFi.setSleep(false);
+	WiFi.setSleep(false);  // Disable WiFi power save for responsiveness
 
-	pinMode(LED_INDICATOR_PIN, OUTPUT);
-	digitalWrite(LED_INDICATOR_PIN, LOW);
+	Serial.print("Connecting to WiFi ");
+	int wifi_retries = 0;
+	while (WiFi.status() != WL_CONNECTED && wifi_retries < 30) {  // ~15 seconds timeout
+		Serial.print(".");
+		digitalWrite(LED_INDICATOR_PIN, !digitalRead(LED_INDICATOR_PIN));  // Blink LED during connection
+		delay(500);
+		wifi_retries++;
+	}
+	digitalWrite(LED_INDICATOR_PIN, LOW);  // LED off after connection attempt
 
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println(" Connected!");
+		Serial.print("IP Address: ");
+		ip = WiFi.localIP();  // Store IP address
+		Serial.println(ip);
+	} else {
+		Serial.println(" Connection Failed!");
+		// Perhaps enter a fallback mode or just continue without WiFi features fully working
+	}
+
+	// --- Task Creation ---
+	// Always create OTA task
+	xTaskCreatePinnedToCore(
+		otaTask,   /* Task function. */
+		"otaTask", /* name of task. */
+		10000,	   /* Stack size of task */
+		NULL,	   /* parameter of the task */
+		5,		   /* priority of the task */
+		NULL,	   /* Task handle to keep track of created task */
+		0);		   /* pin task to core 0 */
+	Serial.println("OTA Task Started.");
+
+	// Check safe boot pin *after* basic setup
 	pinMode(SAFE_BOOT_IN_PIN, INPUT_PULLUP);
 	pinMode(SAFE_BOOT_GND_PIN, OUTPUT);
 	digitalWrite(SAFE_BOOT_GND_PIN, LOW);
 
-	if (digitalRead(SAFE_BOOT_IN_PIN) == HIGH) {
-		xTaskCreatePinnedToCore(otaTask, "otaTask", 10000, NULL, 5, NULL, 0);
-
+	if (digitalRead(SAFE_BOOT_IN_PIN) == LOW) {
+		Serial.println("Safe Boot Pin LOW - Starting Motor Task.");
+		// Create Motor task only if not in safe boot mode
+		xTaskCreatePinnedToCore(
+			motorTask,		  /* Task function. */
+			"motorTask",	  /* name of task. */
+			40000,			  /* Stack size of task */
+			NULL,			  /* parameter of the task */
+			0,				  /* priority of the task (lower than OTA) */
+			&motorTaskHandle, /* Task handle to keep track of created task */
+			1);				  /* pin task to core 1 */
+		Serial.println("Motor Task Started.");
 	} else {
-		xTaskCreatePinnedToCore(otaTask, "otaTask", 10000, NULL, 5, NULL, 0);
-
-		xTaskCreatePinnedToCore(motorTask, "motorTask", 40000, NULL, 0, &motorTaskHandle, 1);
+		Serial.println("Safe Boot Pin HIGH - Skipping Motor Task.");
+		while (true) {
+			digitalWrite(LED_INDICATOR_PIN, !digitalRead(LED_INDICATOR_PIN));
+			vTaskDelay(pdMS_TO_TICKS(100));
+		}
 	}
 }
 
+// --- loop (Keep empty as using FreeRTOS tasks) ---
 void loop() {
-	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	// Empty. Everything is handled in tasks.
+	vTaskSuspend(NULL);	 // Suspend the loop() task itself
 }

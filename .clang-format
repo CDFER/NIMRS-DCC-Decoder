@@ -1,4 +1,5 @@
 # Source: https://github.com/arduino/tooling-project-assets/tree/main/other/clang-format-configuration
+# Modified to improve determinism and readability
 ---
 AccessModifierOffset: -2
 AlignAfterOpenBracket: Align
@@ -13,13 +14,13 @@ AlignTrailingComments: true
 AllowAllArgumentsOnNextLine: true
 AllowAllConstructorInitializersOnNextLine: true
 AllowAllParametersOfDeclarationOnNextLine: true
-AllowShortBlocksOnASingleLine: Always
-AllowShortCaseLabelsOnASingleLine: true
-AllowShortEnumsOnASingleLine: true
-AllowShortFunctionsOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: AllIfsAndElse
-AllowShortLambdasOnASingleLine: Empty
-AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Never # Changed from Always
+AllowShortCaseLabelsOnASingleLine: true # Kept as true - often acceptable
+AllowShortEnumsOnASingleLine: true # Kept as true - often acceptable
+AllowShortFunctionsOnASingleLine: Empty # Kept as Empty - reasonable
+AllowShortIfStatementsOnASingleLine: Never # Changed from AllIfsAndElse
+AllowShortLambdasOnASingleLine: Empty # Kept as Empty - reasonable
+AllowShortLoopsOnASingleLine: false # Changed from true
 AlwaysBreakAfterDefinitionReturnType: None
 AlwaysBreakAfterReturnType: None
 AlwaysBreakBeforeMultilineStrings: false
@@ -27,7 +28,7 @@ AlwaysBreakTemplateDeclarations: No
 AttributeMacros:
   - __capability
 BasedOnStyle: LLVM
-BinPackArguments: true
+BinPackArguments: false
 BinPackParameters: true
 BitFieldColonSpacing: Both
 BraceWrapping:
@@ -58,8 +59,8 @@ BreakBeforeTernaryOperators: true
 BreakConstructorInitializers: BeforeColon
 BreakConstructorInitializersBeforeComma: false
 BreakInheritanceList: BeforeColon
-BreakStringLiterals: false
-ColumnLimit: 0
+BreakStringLiterals: true
+ColumnLimit: 110
 CommentPragmas: ''
 CompactNamespaces: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: false
@@ -100,7 +101,7 @@ IndentCaseBlocks: true
 IndentCaseLabels: true
 IndentExternBlock: Indent
 IndentGotoLabels: false
-IndentPPDirectives: None
+IndentPPDirectives: BeforeHash # Kept as BeforeHash despite issues reported
 IndentRequires: true
 IndentWidth: 4
 IndentWrappedFunctionNames: false
@@ -112,7 +113,7 @@ LambdaBodyIndentation: Signature
 Language: Cpp
 MacroBlockBegin: ''
 MacroBlockEnd: ''
-MaxEmptyLinesToKeep: 100000
+MaxEmptyLinesToKeep: 1
 NamespaceIndentation: None
 ObjCBinPackProtocolList: Auto
 ObjCBlockIndentWidth: 4
@@ -128,19 +129,19 @@ PenaltyBreakFirstLessLess: 1
 PenaltyBreakOpenParenthesis: 1
 PenaltyBreakString: 1
 PenaltyBreakTemplateDeclaration: 1
-PenaltyExcessCharacter: 1
+PenaltyExcessCharacter: 1000000
 PenaltyIndentedWhitespace: 1
 PenaltyReturnTypeOnItsOwnLine: 1
 PointerAlignment: Right
 QualifierAlignment: Leave
 ReferenceAlignment: Pointer
-ReflowComments: false
+ReflowComments: false # Kept false - enable with caution
 RemoveBracesLLVM: false
 SeparateDefinitionBlocks: Leave
 ShortNamespaceLines: 0
-SortIncludes: Never
+SortIncludes: true # Changed from Never
 SortJavaStaticImport: Before
-SortUsingDeclarations: false
+SortUsingDeclarations: true # Changed from false
 SpaceAfterCStyleCast: false
 SpaceAfterLogicalNot: false
 SpaceAfterTemplateKeyword: false
