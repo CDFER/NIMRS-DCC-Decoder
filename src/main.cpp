@@ -24,7 +24,8 @@ IPAddress ip;
 uint16_t telnetPort = 23;
 
 // This is the default DCC Address
-#define DEFAULT_DECODER_ADDRESS 26
+#define DEFAULT_DECODER_ADDRESS_SHORT 70
+#define DEFAULT_DECODER_ADDRESS_LONG 700
 
 #define DCC_PIN 23
 
@@ -60,20 +61,28 @@ struct CVPair {
 };
 
 // CV Addresses we will be using
-#define CV_VSTART 2
-#define CV_VHIGH 5
+#define CV_START_VOLTAGE 2	// Minimum speed of the motor
+
+#define CV_ACCELERATION 3  // is the time from stop to maximum speed (in 896ms increments).
+#define CV_DECELERATION 4  // is the time from maximum speed to stop (in 896ms increments).
+
+#define CV_MAX_SPEED 5			  // Maximum speed of the motor
+#define CV_MID_SPEED 6			  // Medium speed of the motor. Use only if 3-point speed table is enabled.
+#define CV_MOTOR_PWM_FREQUENCY 9  // Motor PWM frequency as a multiple of 1000 Hz.
 
 // Default CV Values Table
 CVPair FactoryDefaultCVs[] = {
-	{ CV_MULTIFUNCTION_PRIMARY_ADDRESS, DEFAULT_DECODER_ADDRESS },
+	// The CV Below defines the Short DCC Address
+	{ CV_MULTIFUNCTION_PRIMARY_ADDRESS, DEFAULT_DECODER_ADDRESS_SHORT },
 
-	{ CV_VSTART, 150 },	 // of 255, adjust as needed for your motor
-	{ CV_VHIGH, 255 },	 // of 255, adjust as needed for your motor
+	{ CV_START_VOLTAGE, 140 },	// of 255, adjust as needed for your motor
+	{ CV_MAX_SPEED, 255 },		// of 255, adjust as needed for your motor
 
+	// These two CVs define the Long DCC Address
 	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_MSB,
-	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_MSB(DEFAULT_DECODER_ADDRESS) },
+	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_MSB(DEFAULT_DECODER_ADDRESS_LONG) },
 	{ CV_MULTIFUNCTION_EXTENDED_ADDRESS_LSB,
-	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_LSB(DEFAULT_DECODER_ADDRESS) },
+	  CALC_MULTIFUNCTION_EXTENDED_ADDRESS_LSB(DEFAULT_DECODER_ADDRESS_LONG) },
 
 	// Ensure CV29 matches decoder capabilities and desired operation
 	// Long Address, 28/128 Speed Steps, F0 Location bit (for lights)
@@ -94,11 +103,11 @@ float map8bitToPwm(uint8_t value) {
 void notifyCVChange(uint16_t CV, uint8_t Value) {
 	telnet.printf("Received CV %d change to %d\n", CV, Value);
 	switch (CV) {
-		case CV_VSTART:
+		case CV_START_VOLTAGE:
 			cvMinSpeed = map8bitToPwm(Value);
 			telnet.printf(" -> cvMinSpeed updated to: %.2f\n", cvMinSpeed);
 			break;
-		case CV_VHIGH:
+		case CV_MAX_SPEED:
 			cvMaxSpeed = map8bitToPwm(Value);
 			// Ensure min speed is not greater than max speed
 			if (cvMinSpeed > cvMaxSpeed) {
@@ -133,7 +142,7 @@ void notifyDccSpeed(
 	// Check if anything changed
 	if (dccDirection != Dir || dccSpeed != correctedSpeed || numSpeedSteps != SpeedSteps) {
 		telnet.printf(
-			"DCC Speed Update: Speed=%d->%d, Dir=%d, Steps=%d\n", Speed, correctedSpeed, Dir, SpeedSteps);
+			"DCC Speed Update: Speed=%d->%d, Dir=%d, Steps=%d\n", dccSpeed, correctedSpeed, Dir, SpeedSteps);
 		dccUpdated = true;
 		dccDirection = Dir;
 		dccSpeed = correctedSpeed;	// Store 0 for stop, 1 to MaxSteps-1 for move
@@ -221,17 +230,15 @@ void motorTask(void* parameter) {
 	pinMode(VCC_RAIL_SENSE, INPUT);
 
 	// --- Initialize DCC ---
-	Dcc.pin(DCC_PIN, 0);  // DCC signal pin, no inversion
-	// Minimal flags, let CV29 control address mode etc.
-	// FLAGS_AUTO_FACTORY_DEFAULT allows reset via broadcast. Add others if needed.
-	Dcc.init(MAN_ID_DIY, 10, FLAGS_MY_ADDRESS_ONLY | FLAGS_AUTO_FACTORY_DEFAULT, 0);
+	Dcc.pin(DCC_PIN, 0);  // DCC signal pin, no pull up
+	Dcc.init(MAN_ID_DIY, DECODER_VERSION, FLAGS_MY_ADDRESS_ONLY | FLAGS_AUTO_FACTORY_DEFAULT, 0);
 
 	// Uncomment to force CV Reset to Factory Defaults on boot
 	notifyCVResetFactoryDefault();
 
 	// Read the initial CV values and map them to the PWM range
-	cvMinSpeed = map8bitToPwm(Dcc.getCV(CV_VSTART));
-	cvMaxSpeed = map8bitToPwm(Dcc.getCV(CV_VHIGH));
+	cvMinSpeed = map8bitToPwm(Dcc.getCV(CV_START_VOLTAGE));
+	cvMaxSpeed = map8bitToPwm(Dcc.getCV(CV_MAX_SPEED));
 
 	// --- Initialize NeoPixels ---
 	Strip.Begin();
@@ -263,8 +270,6 @@ void motorTask(void* parameter) {
 			// Recalculate targetPWM if DCC speed/direction/steps changed
 			if (dccUpdated) {
 				targetPWM = map(float(dccSpeed), 1.0, float(numSpeedSteps), cvMinSpeed, cvMaxSpeed);
-				// targetPWM = constrain(targetPWM, cvMinSpeed, cvMaxSpeed);
-				// telnet.printf("DCC Updated: Recalculated Target PWM = %.2f\n", targetPWM); // Debug
 				dccUpdated = false;	 // Reset flag after recalculating
 			}
 
@@ -328,21 +333,13 @@ void motorTask(void* parameter) {
 		// --- Send Telemetry Periodically ---
 		if (millis() - 100 > last_telemetry_checkpoint) {
 			if (telnet.isConnected()) {
-				telnet.printf(
-					"Vmin:%.1fV Vavg:%.1f DCC:%d Target:%.0f(%.0f%%) Smooth:%.0f(%.0f%%) Out:%d(%.0f%%) "
-					"Min:%.0f Max:%.0f MCU Temp:%0.1f°C\n",
-					minVolt / 1000.0,
-					avgVolt / 1000.0,
-					dccSpeed,
-					targetPWM,
-					(targetPWM / float(MAX_PWM)) * 100.0,
-					smoothedPWM,
-					(smoothedPWM / float(MAX_PWM)) * 100.0,
-					outputIntPWM,
-					(float(outputIntPWM) / float(MAX_PWM)) * 100.0,
-					cvMinSpeed,
-					cvMaxSpeed,
-					temperatureRead());
+				telnet.printf("Vmin:%.1fV Vavg:%.1f DCC:%d Out:%d(%.0f%%) MCU Temp:%0.1f°C\n",
+							  minVolt / 1000.0,
+							  avgVolt / 1000.0,
+							  dccSpeed,
+							  outputIntPWM,
+							  (float(outputIntPWM) / float(MAX_PWM)) * 100.0,
+							  temperatureRead());
 			}
 			last_telemetry_checkpoint = millis();
 			minVolt = 16000.0;	// Reset min voltage for next interval
@@ -449,7 +446,7 @@ void setup() {
 
 	Serial.print("Connecting to WiFi ");
 	int wifi_retries = 0;
-	while (WiFi.status() != WL_CONNECTED && wifi_retries < 30) {  // ~15 seconds timeout
+	while (WiFi.status() != WL_CONNECTED && wifi_retries < 6) {	 // ~3 second timeout
 		Serial.print(".");
 		digitalWrite(LED_INDICATOR_PIN, !digitalRead(LED_INDICATOR_PIN));  // Blink LED during connection
 		delay(500);
@@ -464,7 +461,6 @@ void setup() {
 		Serial.println(ip);
 	} else {
 		Serial.println(" Connection Failed!");
-		// Perhaps enter a fallback mode or just continue without WiFi features fully working
 	}
 
 	// --- Task Creation ---
